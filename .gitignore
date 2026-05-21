@@ -165,3 +165,48 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# Custom datasets / generated data
+custom_ft_dataset_raw_action/
+custom_ft_dataset_raw_action_alltrain/
+multi_task_dataset_raw_action/
+multi_task_dataset_raw_action_alltrain/
+multi_task_dataset_raw_action_alltrain_act_norm/
+
+# Pretrained repo / weights
+flower_vla_pret/
+
+# EDA outputs
+action_eda.json
+action_eda2.json
+action_eda_plots/
+
+# Logs / checkpoints
+logs/
+wandb/
+outputs/
+runs/
+saved_models/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+
+# Dataset / binary files
+*.pkl
+*.npz
+*.h5
+*.hdf5
+*.tfrecord
+*.npy
+
+# Python / notebook cache
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/

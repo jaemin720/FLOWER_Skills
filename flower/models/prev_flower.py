@@ -239,20 +239,7 @@ class FLOWERVLA(pl.LightningModule):
             new_state_dict[new_key] = value
 
         # Load the state dict with strict=False to handle mismatches
-        #missing_keys, unexpected_keys = self.load_state_dict(new_state_dict, strict=False) 기존 코드
-        model_state = self.state_dict()
-        filtered_state_dict = {}
-
-        for key, value in new_state_dict.items():
-            if key not in model_state:
-                continue
-            if model_state[key].shape != value.shape:
-                print(f"Skipping mismatched key: {key} ckpt={value.shape} model={model_state[key].shape}")
-                continue
-            filtered_state_dict[key] = value
-
-        missing_keys, unexpected_keys = self.load_state_dict(filtered_state_dict, strict=False)
-
+        missing_keys, unexpected_keys = self.load_state_dict(new_state_dict, strict=False)
 
         # Log mismatches for debugging
         print(f"Pretrained weights loaded with the following issues:")
@@ -312,11 +299,7 @@ class FLOWERVLA(pl.LightningModule):
         """Initialize and configure the Florence-2 VLM"""
         print(f"Loading Florence-2 from {vlm_path}")
         
-        self.vlm = AutoModelForCausalLM.from_pretrained(
-            vlm_path,
-            trust_remote_code=True,
-            attn_implementation="eager",
-        )
+        self.vlm = AutoModelForCausalLM.from_pretrained(vlm_path, trust_remote_code=True)
         
         # Handle parameter freezing
         if freeze_florence:
@@ -397,12 +380,9 @@ class FLOWERVLA(pl.LightningModule):
                 self.adaln[action_name] = SharedAdaLNController(dit_dim, global_conddim=dit_dim, use_cross_attn=use_cross_attn)
 
             if self.use_proprio:
-                self.proprio_encoders[action_name] = Mlp(
-                    in_features=self.lowdim_obs_dim,
-                    hidden_features=dit_dim,
-                    out_features=dit_dim,
-                    drop=0.2,
-                ).to(self.device)
+                # Add proprio encoder if needed for bimanual nav variant otherwise use zero encoder
+                self.proprio_encoders[action_name] = (Mlp(input_dim, dit_dim, out_features=dit_dim, drop=0.2).to(self.device) 
+                    if action_name == 'bimanual_nav' else ZeroEncoder(self.dit_dim, device=self.device))
 
     def configure_optimizers(self):
         """Configure optimizers and schedulers"""
@@ -653,7 +633,7 @@ class FLOWERVLA(pl.LightningModule):
         """
         Encode proprioception based on action type.
         """
-        batch_size = output_shape[0]
+        batch_size, _ = output_shape
         default_dtype = next(self.parameters()).dtype
         
         if not self.use_proprio:
@@ -664,8 +644,7 @@ class FLOWERVLA(pl.LightningModule):
         for action_name, action_idx in self.action_space_index.action_spaces.items():
             mask = (action_type == action_idx)
             if mask.any():
-                encoded = self.proprio_encoders[action_name](proprio[mask]).squeeze(1)
-                encoded_proprio[mask] = encoded.to(encoded_proprio.dtype)
+                encoded_proprio[mask] = self.proprio_encoders[action_name](proprio[mask]).squeeze(1)
         
         return encoded_proprio
 
@@ -714,10 +693,8 @@ class FLOWERVLA(pl.LightningModule):
         default_type = next(self.parameters()).dtype
         
         
-        batch_size = len(batch["rgb_obs"]['rgb_static'])
-        embed_tensor = torch.zeros(batch_size, 1, 1)
-        # Single-action-space setup: action type is one id per batch element.
-        action_type_tensor = torch.ones(batch_size, dtype=torch.long)
+        embed_tensor = torch.zeros(len(batch["rgb_obs"]['rgb_static']), 1, 1)
+        action_type_tensor = torch.ones(len(batch["rgb_obs"]['rgb_static']), self.act_window_size, 7)
         # Process primary image
         image_tensor = batch["rgb_obs"]['rgb_static']
         B, T, C, H, W = image_tensor.shape
@@ -766,22 +743,19 @@ class FLOWERVLA(pl.LightningModule):
 
         # Prepare frequency and action space embeddings
         frequency_embeds = self.frequency_embedder(
-            torch.ones_like(embed_tensor).to(device) * 10 #여기서는 하드코딩으로 3으로 고정했었지만 우리 로봇은 10Hz로 10으로 하드 코딩함. 나중에 고쳐야함.
+            torch.ones_like(embed_tensor).to(device) * 3
         )
         
         # Get proprioception if enabled
         proprio = None
-        if self.use_proprio:
-            if "robot_obs" in batch:
-                proprio = batch["robot_obs"][:, -1].to(device).to(default_type)
-            elif self.obs_modalities and self.obs_modalities in batch and 'proprio' in batch[self.obs_modalities]:
-                proprio = batch[self.obs_modalities]['proprio'].to(device).to(default_type)
+        if self.use_proprio and 'proprio' in batch[self.obs_modalities]:
+            proprio = batch[self.obs_modalities]['proprio'].to(device).to(default_type)
 
         return {
             'features': features,
             'frequency_embeds': frequency_embeds,
             'action_space_embeds': None,
-            'action_type': action_type_tensor,
+            'action_type': torch.ones_like(action_type_tensor), # actiont ype is always 1
             'proprio': proprio,
             'attention_mask': attention_mask,
         }
@@ -844,16 +818,6 @@ class FLOWERVLA(pl.LightningModule):
             },
             "lang_text": [goal["lang_text"]]
         }
-        if self.use_proprio:
-            if "robot_obs" in obs:
-                batch["robot_obs"] = obs["robot_obs"]
-            elif "robot_obs_raw" in obs:
-                robot_obs_raw = obs["robot_obs_raw"]
-                if robot_obs_raw.dim() == 1:
-                    robot_obs_raw = robot_obs_raw.unsqueeze(0).unsqueeze(0)
-                elif robot_obs_raw.dim() == 2:
-                    robot_obs_raw = robot_obs_raw.unsqueeze(0)
-                batch["robot_obs"] = robot_obs_raw
         features = self.encode_observations(batch)
         
         # Generate initial noise
@@ -973,6 +937,7 @@ class FLOWERVLA(pl.LightningModule):
                 
             else:
                 raise ValueError(f"Unknown prompt style: {self.vlm_prompt_style}")
+        
         
         return text_prompts
     

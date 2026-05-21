@@ -56,7 +56,7 @@ def setup_logger(cfg: DictConfig, model: LightningModule):
         cfg.logger.id = cfg.logger.name.replace("/", "_")
     return hydra.utils.instantiate(cfg.logger)
 
-@hydra.main(config_path="../conf", config_name="config_custom_calvin")
+@hydra.main(config_path="../conf", config_name="config_custom_calvin_alltrain_onlyft")
 def train(cfg: DictConfig) -> None:
     try:
         # Setup environment

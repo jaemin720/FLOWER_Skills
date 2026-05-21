@@ -26,6 +26,7 @@ class HulcDataModule(pl.LightningDataModule):
         num_workers: int = 8,
         transforms: DictConfig = DEFAULT_TRANSFORM,
         shuffle_val: bool = False,
+        use_validation: bool = True,
         **kwargs: Dict,
     ):
         super().__init__()
@@ -34,6 +35,7 @@ class HulcDataModule(pl.LightningDataModule):
         self.val_datasets = None
         self.train_sampler = None
         self.val_sampler = None
+        self.use_validation = use_validation
         self.num_workers = num_workers
         root_data_path = Path(root_data_dir)
         if not root_data_path.is_absolute():
@@ -100,19 +102,35 @@ class HulcDataModule(pl.LightningDataModule):
         self.train_transforms = {key: torchvision.transforms.Compose(val) for key, val in self.train_transforms.items()}
         self.val_transforms = {key: torchvision.transforms.Compose(val) for key, val in self.val_transforms.items()}
         self.train_datasets, self.train_sampler, self.val_datasets, self.val_sampler = {}, {}, {}, {}
-
         for _, dataset in self.datasets_cfg.items():
             if dataset == 'lang_paraphrase-MiniLM-L3-v2':
                 continue
-            else:
-                train_dataset = hydra.utils.instantiate(
-                    dataset, datasets_dir=self.training_dir, transforms=self.train_transforms
+
+            train_dataset = hydra.utils.instantiate(
+                dataset, datasets_dir=self.training_dir, transforms=self.train_transforms
+            )
+            key = dataset.key
+            self.train_datasets[key] = train_dataset
+            self.modalities.append(key)
+
+            if self.use_validation:
+                val_dataset = hydra.utils.instantiate(
+                    dataset, datasets_dir=self.val_dir, transforms=self.val_transforms
                 )
-                val_dataset = hydra.utils.instantiate(dataset, datasets_dir=self.val_dir, transforms=self.val_transforms)
-                key = dataset.key
-                self.train_datasets[key] = train_dataset
                 self.val_datasets[key] = val_dataset
-                self.modalities.append(key)
+
+        # for _, dataset in self.datasets_cfg.items():
+        #     if dataset == 'lang_paraphrase-MiniLM-L3-v2':
+        #         continue
+        #     else:
+        #         train_dataset = hydra.utils.instantiate(
+        #             dataset, datasets_dir=self.training_dir, transforms=self.train_transforms
+        #         )
+        #         val_dataset = hydra.utils.instantiate(dataset, datasets_dir=self.val_dir, transforms=self.val_transforms)
+        #         key = dataset.key
+        #         self.train_datasets[key] = train_dataset
+        #         self.val_datasets[key] = val_dataset
+        #         self.modalities.append(key)
 
     def train_dataloader(self):
         return {
@@ -127,15 +145,30 @@ class HulcDataModule(pl.LightningDataModule):
             )
             for key, dataset in self.train_datasets.items()
         }
-
     def val_dataloader(self):
-        return  {
+        if not self.use_validation:
+            return None
+
+        return {
             key: DataLoader(
                 dataset,
                 batch_size=dataset.batch_size,
                 num_workers=dataset.num_workers,
-                persistent_workers=True,  # Keep workers alive between epochs
+                persistent_workers=True,
                 pin_memory=True,
             )
             for key, dataset in self.val_datasets.items()
         }
+
+
+    # def val_dataloader(self):
+    #     return  {
+    #         key: DataLoader(
+    #             dataset,
+    #             batch_size=dataset.batch_size,
+    #             num_workers=dataset.num_workers,
+    #             persistent_workers=True,  # Keep workers alive between epochs
+    #             pin_memory=True,
+    #         )
+    #         for key, dataset in self.val_datasets.items()
+    #     }
