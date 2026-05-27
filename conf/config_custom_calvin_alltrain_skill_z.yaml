@@ -1,8 +1,8 @@
 defaults:
   - _self_
   - callbacks: custom_calvin_alltrain
-  - datamodule: custom_calvin_alltrain
-  - model: flower
+  - datamodule: custom_calvin_alltrain_skill_z
+  - model: flower_skill_z
   - override hydra/job_logging: colorlog
   - override hydra/hydra_logging: colorlog
 
@@ -14,14 +14,23 @@ slurm: false
 seed: 242
 device: 'cuda'
 batch_size: 16
-devices: 4
+devices: 2
 act_dim: 7
 proprio_dims: 13
 obs_dim: 512
 goal_dim: 512
 obs_seq_len: 1
-act_seq_len: 10
-multistep: 10
+
+# QueST stage-0 SkillVAE was trained with 32 action steps and downsample_factor=4,
+# so FLOWER predicts 8 continuous z_raw vectors, each 256-D.
+skill_action_seq_len: 32
+skill_z_seq_len: 8
+skill_z_dim: 256
+act_seq_len: ${skill_action_seq_len}
+multistep: ${skill_action_seq_len}
+
+quest_autoencoder_checkpoint: /home/jack/flower_vla_calvin/quest/multitask_model_epoch_0200.pth
+
 p_last_state: 0
 gen_img_res: 112
 max_epochs: 20
@@ -43,9 +52,9 @@ trainer:
 logger:
   _target_: pytorch_lightning.loggers.WandbLogger
   save_dir: ${log_dir}
-  name: jack_usb_training
+  name: jack_usb_training_skill_z
   group: vla_real_data
-  project: flower_vla_Multi_Finetune_proprio_ft_raw
+  project: flower_vla_Multi_Finetune_proprio_ft_skill_z
   entity: hjm20720-d
   id: ???
 

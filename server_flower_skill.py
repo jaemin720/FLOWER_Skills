@@ -140,9 +140,9 @@ def load_model(
     checkpoint_path: Path,
     run_cfg,
     device: torch.device,
-    multistep: int,
-    action_horizon: int,
-    num_sampling_steps: int,
+    multistep: Optional[int],
+    action_horizon: Optional[int],
+    num_sampling_steps: Optional[int],
     use_wrist: bool,
     use_torch_compile: bool,
     use_ema_weights: bool,
@@ -151,9 +151,12 @@ def load_model(
     model_cfg.pop("_recursive_", None)
     class_name = model_cfg.pop("_target_")
 
-    model_cfg["multistep"] = multistep
-    model_cfg["act_window_size"] = action_horizon
-    model_cfg["num_sampling_steps"] = num_sampling_steps
+    if multistep is not None:
+        model_cfg["multistep"] = multistep
+    if action_horizon is not None:
+        model_cfg["act_window_size"] = action_horizon
+    if num_sampling_steps is not None:
+        model_cfg["num_sampling_steps"] = num_sampling_steps
     model_cfg["use_second_view"] = use_wrist
     model_cfg["second_view_key"] = "rgb_gripper"
 
@@ -163,6 +166,8 @@ def load_model(
         map_location=device,
         **model_cfg,
     )
+    if model_cfg.get("flow_target") == "skill_z":
+        model.decode_skill_actions_for_inference = False
 
     if use_ema_weights:
         apply_ema_weights(model, checkpoint_path)
@@ -205,13 +210,23 @@ class FlowerInferenceServer:
             use_ema_weights=not args.no_use_ema,
         )
 
-        # QueST autoencoder 모델 로드 
+        self.flow_target = getattr(self.model, "flow_target", self.cfg.model.get("flow_target", "actions"))
+        self.skill_embedding_space = getattr(
+            self.model,
+            "skill_embedding_space",
+            self.cfg.model.get("skill_embedding_space", "encoder"),
+        )
+        self.skill_autoencoder = None
+        self.skill_action_seq = None
+        self.skill_action_step_counter = 0
+        self._prepare_skill_decoder()
 
         LOGGER.info("Loaded checkpoint: %s", self.checkpoint_path)
         LOGGER.info("Run directory: %s", self.run_dir)
         LOGGER.info("Device: %s", self.device)
         LOGGER.info("Using wrist view: %s", self.use_wrist)
         LOGGER.info("Using proprio: %s", self.use_proprio)
+        LOGGER.info("Flow target: %s", self.flow_target)
 
         if args.data_name:
             LOGGER.warning("--data_name is ignored by this server.")
@@ -231,6 +246,39 @@ class FlowerInferenceServer:
     def reset(self, text: str):
         self.prompt_text = text
         self.model.reset()
+        self.skill_action_seq = None
+        self.skill_action_step_counter = 0
+
+    def _prepare_skill_decoder(self) -> None:
+        if self.flow_target != "skill_z":
+            return
+        if self.skill_embedding_space != "encoder":
+            raise ValueError("server_flower_copy.py currently expects encoder-space skill z.")
+
+        self.model.decode_skill_actions_for_inference = False
+        self.skill_autoencoder = getattr(self.model, "skill_target_autoencoder", None)
+        if self.skill_autoencoder is None:
+            raise RuntimeError("Skill-z checkpoint did not load a QueST autoencoder.")
+
+        self.skill_autoencoder = self.skill_autoencoder.to(self.device)
+        self.skill_autoencoder.eval()
+        for param in self.skill_autoencoder.parameters():
+            param.requires_grad_(False)
+
+        LOGGER.info(
+            "Loaded QueST SkillVAE decoder: skill_block_size=%s, z_dim=%s",
+            getattr(self.skill_autoencoder, "skill_block_size", "unknown"),
+            getattr(self.skill_autoencoder, "encoder_dim", "unknown"),
+        )
+
+    @torch.no_grad()
+    def _decode_skill_z(self, skill_z: torch.Tensor) -> torch.Tensor:
+        if self.skill_autoencoder is None:
+            raise RuntimeError("QueST autoencoder is not loaded.")
+
+        skill_z = skill_z.to(self.device, dtype=torch.float32)
+        codes, _, _, _, _ = self.skill_autoencoder.quantize(skill_z)
+        return self.skill_autoencoder.decode(codes)
 
     def _build_observation(self, payload: dict) -> dict:
         image_primary = payload.get("image_primary", payload.get("image", payload.get("rgb_static")))
@@ -285,17 +333,24 @@ class FlowerInferenceServer:
         obs = self._build_observation(obs_payload)
         goal = {"lang_text": self.prompt_text}
 
-        autocast_context = (
-            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-            if self.device.type == "cuda"
-            else torch.autocast(device_type="cpu", enabled=False)
+        autocast_context = torch.autocast(
+            device_type=self.device.type,
+            dtype=torch.bfloat16,
+            enabled=self.device.type == "cuda",
         )
         with torch.inference_mode():
-            with autocast_context:
-                action = self.model.step(obs, goal) # 여기서 나오는 action = z
+            if self.flow_target == "skill_z":
+                if self.skill_action_seq is None or self.skill_action_step_counter >= self.skill_action_seq.shape[1]:
+                    with autocast_context:
+                        skill_z = self.model(obs, goal)
+                    self.skill_action_seq = self._decode_skill_z(skill_z)
+                    self.skill_action_step_counter = 0
 
-            # z quantize
-            # QueST autoencoder의 decode()로 action 복원
+                action = self.skill_action_seq[0, self.skill_action_step_counter]
+                self.skill_action_step_counter += 1
+            else:
+                with autocast_context:
+                    action = self.model.step(obs, goal)
 
         action_np = action.detach().cpu().numpy().astype(np.float32)
         return np.squeeze(action_np)
@@ -311,6 +366,7 @@ def build_app(server: FlowerInferenceServer) -> FastAPI:
             "checkpoint": str(server.checkpoint_path),
             "run_dir": str(server.run_dir),
             "device": str(server.device),
+            "flow_target": server.flow_target,
         }
 
     @app.post("/reset")
@@ -365,9 +421,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=45587)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--image_size", type=int, default=None, help="Ignored. Kept for compatibility.")
-    parser.add_argument("--action_horizon", type=int, default=10)
-    parser.add_argument("--multistep", type=int, default=1)
-    parser.add_argument("--num_sampling_steps", type=int, default=4)
+    parser.add_argument("--action_horizon", type=int, default=None)
+    parser.add_argument("--multistep", type=int, default=None)
+    parser.add_argument("--num_sampling_steps", type=int, default=None)
     parser.add_argument("--control_frequency", type=int, default=None, help="Ignored. Kept for compatibility.")
     parser.add_argument("--robot_name", default=None, help="Ignored. Kept for compatibility.")
     parser.add_argument("--prompt_style", default=None, help="Ignored. Kept for compatibility.")

@@ -1,5 +1,6 @@
 import logging
 import os
+import sys
 from typing import Any, Dict, Optional, Tuple, Collection, List
 from functools import partial
 import math
@@ -85,11 +86,30 @@ class FLOWERVLA(pl.LightningModule):
 
         load_pretrained: bool = False,
         pretrained_model_path: str = None,
+        flow_target: str = "actions",
+        quest_repo_path: Optional[str] = None,
+        quest_autoencoder_checkpoint: Optional[str] = None,
+        skill_embedding_space: str = "encoder",
+        decode_skill_actions_for_inference: bool = False,
+        clip_sampled_actions: Optional[bool] = None,
     ):
         super().__init__()
         self.save_hyperparameters()
         # self.automatic_optimization = False
         self.action_space_index = ActionIndex()
+        self.flow_target = flow_target
+        self.skill_embedding_space = skill_embedding_space
+        self.decode_skill_actions_for_inference = decode_skill_actions_for_inference
+        self.quest_repo_path = quest_repo_path
+        self.quest_autoencoder_checkpoint = quest_autoencoder_checkpoint
+        self.clip_sampled_actions = flow_target == "actions" if clip_sampled_actions is None else clip_sampled_actions
+        self.skill_target_autoencoder = None
+        if self.flow_target not in ("actions", "skill_z"):
+            raise ValueError(f"Unsupported flow_target: {self.flow_target}")
+        if self.skill_embedding_space not in ("encoder", "quantizer"):
+            raise ValueError(f"Unsupported skill_embedding_space: {self.skill_embedding_space}")
+        if self.flow_target == "skill_z":
+            self.action_space_index.action_dims["eef_delta"] = action_dim
         # Initialize model flags and configurations
         self._init_flags(
             use_second_view=use_second_view,
@@ -119,6 +139,11 @@ class FLOWERVLA(pl.LightningModule):
             num_sampling_steps=num_sampling_steps,
         )
         self.target_modality = "actions"
+        if self.flow_target == "skill_z":
+            self.skill_target_autoencoder = self._load_quest_autoencoder(
+                quest_autoencoder_checkpoint,
+                quest_repo_path,
+            )
         # Setup VLM and core components
         self._setup_vlm(vlm_path, freeze_vision_tower, freeze_florence)
         hidden_dim = self.vlm.config.text_config.d_model
@@ -155,6 +180,57 @@ class FLOWERVLA(pl.LightningModule):
 
         if load_pretrained and pretrained_model_path is not None:
             self._load_pretrained_weights(pretrained_model_path)
+
+    def _load_quest_autoencoder(self, checkpoint_path: Optional[str], quest_repo_path: Optional[str]) -> nn.Module:
+        if checkpoint_path is None:
+            raise ValueError("flow_target='skill_z' requires quest_autoencoder_checkpoint.")
+        if quest_repo_path is not None and os.path.exists(quest_repo_path) and quest_repo_path not in sys.path:
+            sys.path.insert(0, quest_repo_path)
+
+        try:
+            from hydra.utils import instantiate
+        except ImportError as exc:
+            raise ImportError(
+                "Could not import hydra.utils.instantiate. Install hydra-core in the training environment."
+            ) from exc
+
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        cfg = checkpoint.get("cfg", checkpoint.get("config"))
+        if cfg is None:
+            raise KeyError(f"QueST checkpoint has no cfg/config entry: {checkpoint_path}")
+        cfg = OmegaConf.create(cfg)
+
+        state = checkpoint.get("model", checkpoint.get("state_dict", checkpoint))
+        autoencoder_cfg = OmegaConf.to_container(cfg.algo.policy.autoencoder, resolve=False)
+        autoencoder_cfg["action_dim"] = int(cfg.task.shape_meta.action_dim)
+        autoencoder_cfg["skill_block_size"] = int(cfg.algo.skill_block_size)
+        autoencoder_cfg["downsample_factor"] = int(cfg.algo.downsample_factor)
+        autoencoder_cfg["codebook_size"] = int(cfg.algo.codebook_size)
+        autoencoder_cfg["_target_"] = "flower.models.quest_skill_vae.SkillVAE"
+        autoencoder = instantiate(OmegaConf.create(autoencoder_cfg))
+        autoencoder_state = {
+            key.removeprefix("autoencoder."): value
+            for key, value in state.items()
+            if key.startswith("autoencoder.")
+        }
+        if not autoencoder_state:
+            autoencoder_state = state
+        missing_keys, unexpected_keys = autoencoder.load_state_dict(autoencoder_state, strict=False)
+        if missing_keys:
+            logger.warning("QueST autoencoder missing keys while loading: %s", missing_keys[:20])
+        if unexpected_keys:
+            logger.warning("QueST autoencoder unexpected keys while loading: %s", unexpected_keys[:20])
+        autoencoder.eval()
+        for param in autoencoder.parameters():
+            param.requires_grad = False
+
+        logger.info(
+            "Loaded QueST autoencoder from %s with downsample_factor=%s, encoder_dim=%s",
+            checkpoint_path,
+            getattr(autoencoder, "downsample_factor", "unknown"),
+            getattr(autoencoder, "encoder_dim", "unknown"),
+        )
+        return autoencoder
 
     def _load_pretrained_weights(self, pretrained_model_path: str, mean_resizing: bool = False):
         """Loads pretrained weights, handling key mismatches (e.g., different prefixes)."""
@@ -239,7 +315,20 @@ class FLOWERVLA(pl.LightningModule):
             new_state_dict[new_key] = value
 
         # Load the state dict with strict=False to handle mismatches
-        missing_keys, unexpected_keys = self.load_state_dict(new_state_dict, strict=False)
+        #missing_keys, unexpected_keys = self.load_state_dict(new_state_dict, strict=False) 기존 코드
+        model_state = self.state_dict()
+        filtered_state_dict = {}
+
+        for key, value in new_state_dict.items():
+            if key not in model_state:
+                continue
+            if model_state[key].shape != value.shape:
+                print(f"Skipping mismatched key: {key} ckpt={value.shape} model={model_state[key].shape}")
+                continue
+            filtered_state_dict[key] = value
+
+        missing_keys, unexpected_keys = self.load_state_dict(filtered_state_dict, strict=False)
+
 
         # Log mismatches for debugging
         print(f"Pretrained weights loaded with the following issues:")
@@ -299,7 +388,11 @@ class FLOWERVLA(pl.LightningModule):
         """Initialize and configure the Florence-2 VLM"""
         print(f"Loading Florence-2 from {vlm_path}")
         
-        self.vlm = AutoModelForCausalLM.from_pretrained(vlm_path, trust_remote_code=True)
+        self.vlm = AutoModelForCausalLM.from_pretrained(
+            vlm_path,
+            trust_remote_code=True,
+            attn_implementation="eager",
+        )
         
         # Handle parameter freezing
         if freeze_florence:
@@ -380,9 +473,12 @@ class FLOWERVLA(pl.LightningModule):
                 self.adaln[action_name] = SharedAdaLNController(dit_dim, global_conddim=dit_dim, use_cross_attn=use_cross_attn)
 
             if self.use_proprio:
-                # Add proprio encoder if needed for bimanual nav variant otherwise use zero encoder
-                self.proprio_encoders[action_name] = (Mlp(input_dim, dit_dim, out_features=dit_dim, drop=0.2).to(self.device) 
-                    if action_name == 'bimanual_nav' else ZeroEncoder(self.dit_dim, device=self.device))
+                self.proprio_encoders[action_name] = Mlp(
+                    in_features=self.lowdim_obs_dim,
+                    hidden_features=dit_dim,
+                    out_features=dit_dim,
+                    drop=0.2,
+                ).to(self.device)
 
     def configure_optimizers(self):
         """Configure optimizers and schedulers"""
@@ -430,6 +526,45 @@ class FLOWERVLA(pl.LightningModule):
             {"params": no_decay_group, "weight_decay": 0.0}
         ]
 
+    @torch.no_grad()
+    def _encode_skill_targets(self, batch: Dict) -> torch.Tensor:
+        if self.skill_target_autoencoder is None:
+            raise RuntimeError("skill_target_autoencoder is not loaded.")
+
+        actions = batch["actions"]
+        if len(actions.shape) == 4:
+            actions = actions.squeeze(1)
+        actions = actions.to(self.device, dtype=torch.float32)
+
+        autoencoder = self.skill_target_autoencoder.to(self.device)
+        autoencoder.eval()
+
+        ft = batch.get("masked_ft", batch.get("ft", None))
+        if getattr(autoencoder, "use_ft_conditioning", False):
+            ft = ft.to(self.device, dtype=torch.float32) if ft is not None else None
+            z_raw = autoencoder.encode(actions, ft=ft)
+        else:
+            z_raw = autoencoder.encode(actions)
+
+        if self.skill_embedding_space == "quantizer":
+            project_in = getattr(getattr(autoencoder, "vq", None), "project_in", None)
+            if project_in is None:
+                raise ValueError("skill_embedding_space='quantizer' requires autoencoder.vq.project_in.")
+            z_raw = project_in(z_raw)
+
+        if z_raw.shape[1] != self.act_window_size or z_raw.shape[2] != self.action_dim:
+            raise ValueError(
+                "QueST z target shape does not match FLOWER output shape: "
+                f"z={tuple(z_raw.shape)}, expected (*, {self.act_window_size}, {self.action_dim}). "
+                "Check act_seq_len, act_window_size, action_dim, and the QueST autoencoder config."
+            )
+        return z_raw.detach()
+
+    def _get_flow_targets(self, batch: Dict) -> torch.Tensor:
+        if self.flow_target == "skill_z":
+            return self._encode_skill_targets(batch)
+        return batch["actions"]
+
     def training_step(self, batch: Dict[str, Dict], batch_idx: int) -> torch.Tensor:
         """Lightning training step"""
         # Get optimizer
@@ -443,10 +578,11 @@ class FLOWERVLA(pl.LightningModule):
         for modality_scope, dataset_batch in batch.items():
             self.modality_scope = modality_scope
             obs_features = self.encode_observations(dataset_batch)
-            act_loss, losses_dict = self.rf_loss(obs_features, dataset_batch["actions"])
+            flow_targets = self._get_flow_targets(dataset_batch)
+            act_loss, losses_dict = self.rf_loss(obs_features, flow_targets)
             action_loss = action_loss + act_loss
             total_loss = total_loss + act_loss
-            total_bs = total_bs + len(dataset_batch["actions"])
+            total_bs = total_bs + len(flow_targets)
 
         total_loss = total_loss / len(batch)
 
@@ -475,7 +611,7 @@ class FLOWERVLA(pl.LightningModule):
         output = {}
         with torch.no_grad():
             obs_features = self.encode_observations(batch)
-            target_actions = batch[self.target_modality]
+            target_actions = self._get_flow_targets(batch)
             
             # Generate noise for sampling
             noise_actions = torch.randn_like(target_actions, device=self.device)
@@ -563,7 +699,9 @@ class FLOWERVLA(pl.LightningModule):
             vc = self.dit_forward(z, t_tensor, cond)
             z = z - dt_tensor * vc
 
-        return z.clamp(-1, 1)
+        if self.clip_sampled_actions:
+            z = z.clamp(-1, 1)
+        return z
 
     def dit_forward(self, z: torch.Tensor, t: torch.Tensor, cond_dict: dict) -> torch.Tensor:
         """
@@ -633,7 +771,7 @@ class FLOWERVLA(pl.LightningModule):
         """
         Encode proprioception based on action type.
         """
-        batch_size, _ = output_shape
+        batch_size = output_shape[0]
         default_dtype = next(self.parameters()).dtype
         
         if not self.use_proprio:
@@ -644,7 +782,8 @@ class FLOWERVLA(pl.LightningModule):
         for action_name, action_idx in self.action_space_index.action_spaces.items():
             mask = (action_type == action_idx)
             if mask.any():
-                encoded_proprio[mask] = self.proprio_encoders[action_name](proprio[mask]).squeeze(1)
+                encoded = self.proprio_encoders[action_name](proprio[mask]).squeeze(1)
+                encoded_proprio[mask] = encoded.to(encoded_proprio.dtype)
         
         return encoded_proprio
 
@@ -693,8 +832,10 @@ class FLOWERVLA(pl.LightningModule):
         default_type = next(self.parameters()).dtype
         
         
-        embed_tensor = torch.zeros(len(batch["rgb_obs"]['rgb_static']), 1, 1)
-        action_type_tensor = torch.ones(len(batch["rgb_obs"]['rgb_static']), self.act_window_size, 7)
+        batch_size = len(batch["rgb_obs"]['rgb_static'])
+        embed_tensor = torch.zeros(batch_size, 1, 1)
+        # Single-action-space setup: action type is one id per batch element.
+        action_type_tensor = torch.ones(batch_size, dtype=torch.long)
         # Process primary image
         image_tensor = batch["rgb_obs"]['rgb_static']
         B, T, C, H, W = image_tensor.shape
@@ -743,19 +884,22 @@ class FLOWERVLA(pl.LightningModule):
 
         # Prepare frequency and action space embeddings
         frequency_embeds = self.frequency_embedder(
-            torch.ones_like(embed_tensor).to(device) * 3
+            torch.ones_like(embed_tensor).to(device) * 10 #여기서는 하드코딩으로 3으로 고정했었지만 우리 로봇은 10Hz로 10으로 하드 코딩함. 나중에 고쳐야함.
         )
         
         # Get proprioception if enabled
         proprio = None
-        if self.use_proprio and 'proprio' in batch[self.obs_modalities]:
-            proprio = batch[self.obs_modalities]['proprio'].to(device).to(default_type)
+        if self.use_proprio:
+            if "robot_obs" in batch:
+                proprio = batch["robot_obs"][:, -1].to(device).to(default_type)
+            elif self.obs_modalities and self.obs_modalities in batch and 'proprio' in batch[self.obs_modalities]:
+                proprio = batch[self.obs_modalities]['proprio'].to(device).to(default_type)
 
         return {
             'features': features,
             'frequency_embeds': frequency_embeds,
             'action_space_embeds': None,
-            'action_type': torch.ones_like(action_type_tensor), # actiont ype is always 1
+            'action_type': action_type_tensor,
             'proprio': proprio,
             'attention_mask': attention_mask,
         }
@@ -795,6 +939,19 @@ class FLOWERVLA(pl.LightningModule):
                 decoded = pred
         return decoded
 
+    @torch.no_grad()
+    def decode_skill_z(self, z: torch.Tensor) -> torch.Tensor:
+        if self.skill_target_autoencoder is None:
+            raise RuntimeError("skill_target_autoencoder is not loaded.")
+        if self.skill_embedding_space != "encoder":
+            raise ValueError("decode_skill_z currently expects encoder-space z_raw targets.")
+
+        autoencoder = self.skill_target_autoencoder.to(z.device)
+        autoencoder.eval()
+        z = z.to(dtype=torch.float32)
+        codes, _, _, _, _ = autoencoder.quantize(z)
+        return autoencoder.decode(codes)
+
     def forward(self, obs: Dict, goal: Dict) -> torch.Tensor:
         """
         Forward pass for inference.
@@ -818,6 +975,16 @@ class FLOWERVLA(pl.LightningModule):
             },
             "lang_text": [goal["lang_text"]]
         }
+        if self.use_proprio:
+            if "robot_obs" in obs:
+                batch["robot_obs"] = obs["robot_obs"]
+            elif "robot_obs_raw" in obs:
+                robot_obs_raw = obs["robot_obs_raw"]
+                if robot_obs_raw.dim() == 1:
+                    robot_obs_raw = robot_obs_raw.unsqueeze(0).unsqueeze(0)
+                elif robot_obs_raw.dim() == 2:
+                    robot_obs_raw = robot_obs_raw.unsqueeze(0)
+                batch["robot_obs"] = robot_obs_raw
         features = self.encode_observations(batch)
         
         # Generate initial noise
@@ -828,8 +995,10 @@ class FLOWERVLA(pl.LightningModule):
             device=features['features'].device
         )
         
-        # Sample actions
-        return self.sample_actions(noise, features, inference=True)
+        sampled = self.sample_actions(noise, features, inference=True)
+        if self.flow_target == "skill_z" and self.decode_skill_actions_for_inference:
+            return self.decode_skill_z(sampled)
+        return sampled
 
     def step(self, obs: Dict, goal: Dict) -> torch.Tensor:
         """
@@ -937,7 +1106,6 @@ class FLOWERVLA(pl.LightningModule):
                 
             else:
                 raise ValueError(f"Unknown prompt style: {self.vlm_prompt_style}")
-        
         
         return text_prompts
     

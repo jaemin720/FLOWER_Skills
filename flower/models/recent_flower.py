@@ -38,46 +38,6 @@ from flower.models.utils import ActionIndex, generate_policy_prompt
 
 logger = logging.getLogger(__name__)
 
-
-class CausalConv1d(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int):
-        super().__init__()
-        self.left_padding = kernel_size - 1
-        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.pad(x, (self.left_padding, 0))
-        return self.conv(x)
-
-
-class ForceHistoryEncoder(nn.Module):
-    def __init__(self, force_dim: int, hidden_dim: int, out_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            CausalConv1d(force_dim, hidden_dim, kernel_size=3),
-            nn.GELU(),
-            CausalConv1d(hidden_dim, hidden_dim, kernel_size=3),
-            nn.GELU(),
-        )
-        self.proj = nn.Linear(hidden_dim, out_dim)
-
-    def forward(self, force_history: torch.Tensor) -> torch.Tensor:
-        if force_history.dim() == 4:
-            force_history = force_history[:, -1]
-        if force_history.dim() == 2:
-            force_history = force_history.unsqueeze(1)
-        if force_history.dim() != 3:
-            raise ValueError(
-                "force_history must have shape [B, T, D] or [B, obs_seq, T, D], "
-                f"got {tuple(force_history.shape)}"
-            )
-
-        x = force_history.transpose(1, 2)
-        x = self.net(x)
-        x = x[:, :, -1]
-        return self.proj(x)
-
-
 class FLOWERVLA(pl.LightningModule):
     def __init__(
         self,
@@ -104,8 +64,6 @@ class FLOWERVLA(pl.LightningModule):
         use_adaln_cond: bool = False,
         use_readout_token: bool = False,
         use_proprio: bool = False,
-        use_force_history: bool = False,
-        force_history_dim: int = 6,
         return_act_chunk: bool = False,
         
         # DiT Configuration
@@ -173,7 +131,6 @@ class FLOWERVLA(pl.LightningModule):
             action_type_adaln=action_type_adaln,
             sampling_type=sampling_type,
             use_proprio=use_proprio,
-            use_force_history=use_force_history,
             return_act_chunk=return_act_chunk,
             second_view_key=second_view_key,
         )
@@ -183,7 +140,6 @@ class FLOWERVLA(pl.LightningModule):
             dit_dim=dit_dim,
             n_heads=n_heads,
             lowdim_obs_dim=lowdim_obs_dim,
-            force_history_dim=force_history_dim,
             action_dim=action_dim,
             act_window_size=act_window_size,
             multistep=multistep,
@@ -544,7 +500,6 @@ class FLOWERVLA(pl.LightningModule):
         self.use_adaln_cond = self.use_adaln_cond 
         self.use_readout_token = self.use_readout_token and self.use_adaln_cond
         self.use_proprio = self.use_proprio 
-        self.use_force_history = self.use_force_history
         self.use_second_view = self.use_second_view and self.second_view_key is not None
         self.use_cross_attn = self.use_cross_attn
         self.use_rope = self.use_rope and not self.use_nope
@@ -608,8 +563,6 @@ class FLOWERVLA(pl.LightningModule):
         self.action_decoders = nn.ModuleDict()
         if self.use_proprio:
             self.proprio_encoders = nn.ModuleDict()
-        if self.use_force_history:
-            self.force_history_encoders = nn.ModuleDict()
             
         self.adaln = nn.ModuleDict() if self.action_type_adaln else None
 
@@ -657,13 +610,6 @@ class FLOWERVLA(pl.LightningModule):
                     hidden_features=dit_dim,
                     out_features=dit_dim,
                     drop=0.2,
-                ).to(self.device)
-
-            if self.use_force_history:
-                self.force_history_encoders[action_name] = ForceHistoryEncoder(
-                    force_dim=kwargs["force_history_dim"],
-                    hidden_dim=max(dit_dim // 4, kwargs["force_history_dim"]),
-                    out_dim=dit_dim,
                 ).to(self.device)
 
     def configure_optimizers(self):
@@ -967,7 +913,6 @@ class FLOWERVLA(pl.LightningModule):
         cond = cond_dict['features'].to(default_dtype)
         frequency_embeds = cond_dict['frequency_embeds'].squeeze(1).to(default_dtype)
         action_type = cond_dict['action_type'].to(self.device)
-        force_history = cond_dict.get("force_history", cond_dict.get("masked_ft", None))
         
         # Handle proprioception
         if self.use_proprio and cond_dict['proprio'] is not None:
@@ -975,12 +920,6 @@ class FLOWERVLA(pl.LightningModule):
             proprio_embeds = self.encode_proprio(proprio, action_type, frequency_embeds.shape)
         else:
             proprio_embeds = torch.zeros_like(frequency_embeds)
-
-        if self.use_force_history and force_history is not None:
-            force_history = force_history.to(device=self.device, dtype=default_dtype)
-            force_history_embeds = self.encode_force_history(force_history, action_type, frequency_embeds.shape)
-        else:
-            force_history_embeds = torch.zeros_like(frequency_embeds)
         
         # Encode actions
         z, valid_dims = self.encode_actions(z, action_type)
@@ -992,8 +931,7 @@ class FLOWERVLA(pl.LightningModule):
         # Process embeddings
         t_emb = stateless_norm(self.t_embedder(t)) + \
                 stateless_norm(frequency_embeds).squeeze(1) + \
-                stateless_norm(proprio_embeds).squeeze(1) + \
-                stateless_norm(force_history_embeds).squeeze(1)
+                stateless_norm(proprio_embeds).squeeze(1)
         
         cond = self.cond_linear(self.cond_norm(cond))
         
@@ -1042,33 +980,13 @@ class FLOWERVLA(pl.LightningModule):
         
         for action_name, action_idx in self.action_space_index.action_spaces.items():
             mask = (action_type == action_idx)
+            print(f"action_idx : {action_idx}")
+            print(f"mask : {mask}")
             if mask.any():
                 encoded = self.proprio_encoders[action_name](proprio[mask]).squeeze(1)
                 encoded_proprio[mask] = encoded.to(encoded_proprio.dtype)
         
         return encoded_proprio
-    
-    def encode_force_history(self, force_history: torch.Tensor, action_type: torch.Tensor, output_shape) -> torch.Tensor:
-        """
-        Encode right_force_history with a causal Conv1D stack for AdaLN conditioning.
-        Expected input is [B, history_len, 6] or [B, obs_seq, history_len, 6].
-        """
-        batch_size = output_shape[0]
-        default_dtype = next(self.parameters()).dtype
-
-        if not self.use_force_history:
-            return torch.zeros(batch_size, self.dit_dim, device=self.device, dtype=default_dtype)
-
-        encoded_force_history = torch.zeros(batch_size, self.dit_dim, device=self.device, dtype=default_dtype)
-        action_type = action_type.to(self.device)
-
-        for action_name, action_idx in self.action_space_index.action_spaces.items():
-            mask = (action_type == action_idx)
-            if mask.any():
-                encoded = self.force_history_encoders[action_name](force_history[mask])
-                encoded_force_history[mask] = encoded.to(encoded_force_history.dtype)
-
-        return encoded_force_history
 
     def action_specific_adaln(self, global_cond: torch.Tensor, action_type: torch.Tensor) -> List[torch.Tensor]:
         """
@@ -1178,21 +1096,12 @@ class FLOWERVLA(pl.LightningModule):
             elif self.obs_modalities and self.obs_modalities in batch and 'proprio' in batch[self.obs_modalities]:
                 proprio = batch[self.obs_modalities]['proprio'].to(device).to(default_type)
 
-        force_history = None
-        if "masked_ft" in batch:
-            force_history = batch["masked_ft"].to(device).to(default_type)
-            if force_history.dim() == 4:
-                force_history = force_history[:, -1]
-        elif "force_history" in batch:
-            force_history = batch["force_history"].to(device).to(default_type)
-
         return {
             'features': features,
             'frequency_embeds': frequency_embeds,
             'action_space_embeds': None,
             'action_type': action_type_tensor,
             'proprio': proprio,
-            'force_history': force_history,
             'attention_mask': attention_mask,
         }
 
@@ -1264,12 +1173,6 @@ class FLOWERVLA(pl.LightningModule):
                 elif robot_obs_raw.dim() == 2:
                     robot_obs_raw = robot_obs_raw.unsqueeze(0)
                 batch["robot_obs"] = robot_obs_raw
-        if "masked_ft" in obs:
-            batch["masked_ft"] = obs["masked_ft"]
-        elif "force_history" in obs:
-            batch["masked_ft"] = obs["force_history"]
-        elif "right_force_history" in obs:
-            batch["masked_ft"] = obs["right_force_history"]
         features = self.encode_observations(batch)
         self.add_quest_skill_conditioning(features, actions=None, train_mode=False)
         
