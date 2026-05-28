@@ -6,7 +6,7 @@ defaults:
   - override hydra/job_logging: colorlog
   - override hydra/hydra_logging: colorlog
 
-root_data_dir: /home/jack/flower_vla_calvin/multi_task_dataset_real_robot_13d_norm_force_history_butter_norm
+root_data_dir: /home/jack/flower_vla_calvin/multi_task_dataset_real_robot_13d_norm_force_history_butter_first
 lang_folder: lang_clip_resnet50
 
 log_dir: /data2/jack/log
@@ -14,7 +14,7 @@ slurm: false
 seed: 242
 device: 'cuda'
 batch_size: 16
-devices: 4
+devices: 2
 act_dim: 7
 proprio_dims: 13
 obs_dim: 512

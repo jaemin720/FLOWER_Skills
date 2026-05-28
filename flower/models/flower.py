@@ -627,8 +627,7 @@ class FLOWERVLA(pl.LightningModule):
             actions = actions.squeeze(1)
         actions = actions.to(self.device, dtype=torch.float32)
 
-        autoencoder = self.skill_target_autoencoder.to(self.device)
-        autoencoder.eval()
+        autoencoder = self.skill_target_autoencoder
 
         ft = batch.get("masked_ft", batch.get("ft", None))
         if getattr(autoencoder, "use_ft_conditioning", False):
@@ -1175,6 +1174,9 @@ class FLOWERVLA(pl.LightningModule):
         # Move core model components to appropriate device/dtype
         self.to(self.device)
         self.vlm.to(self.device)
+        if self.skill_target_autoencoder is not None:
+            self.skill_target_autoencoder.to(self.device)
+            self.skill_target_autoencoder.eval()
         
     def on_validation_start(self):
         """Setup before validation starts."""

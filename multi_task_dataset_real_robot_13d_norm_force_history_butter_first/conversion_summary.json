@@ -1,0 +1,103 @@
+{
+  "input": "/data2/jack/2026_05_AGI/default_lsm/lsm/multi",
+  "validation_input": null,
+  "output_root": "/home/jack/flower_vla_calvin/multi_task_dataset_real_robot_13d_norm_force_history_butter_first",
+  "task_name": "custom_task",
+  "default_instruction": "custom task",
+  "robot_obs_dim": 13,
+  "robot_obs_format": "real_robot",
+  "state_processing": {
+    "enabled": true,
+    "key": "robot_obs",
+    "normalize": true,
+    "smoothing": "none",
+    "stats_path": null,
+    "stats_output": "/home/jack/flower_vla_calvin/multi_task_dataset_real_robot_13d_norm_force_history_butter_first/lowdim_stats.json"
+  },
+  "include_right_ft": false,
+  "include_right_force": false,
+  "history_obs_keys": [
+    "right_force_history"
+  ],
+  "ft_history_processing": {
+    "enabled": true,
+    "keys": [
+      "right_force_history"
+    ],
+    "filter": "butterworth",
+    "normalize": true,
+    "processing_order": "smooth_then_normalize",
+    "stats_domain": "smoothed_history",
+    "sample_rate_hz": 100.0,
+    "cutoff_hz": 10.0,
+    "filter_order": 2,
+    "stats_source": "computed",
+    "stats_path": null,
+    "stats_output": "/home/jack/flower_vla_calvin/multi_task_dataset_real_robot_13d_norm_force_history_butter_first/force_history_stats.json"
+  },
+  "validation_ft_history_processing": {
+    "enabled": false
+  },
+  "trim_zero_actions": true,
+  "trailing_keep": 5,
+  "relabel_gripper_from_state": true,
+  "real_robot_processing": {
+    "num_before_processing": 500,
+    "num_all_zero_action_episodes": 0,
+    "num_trimmed_steps": 5548,
+    "num_after_processing": 500,
+    "num_skipped_short_episodes": 0,
+    "num_after_filtering": 500
+  },
+  "validation_real_robot_processing": null,
+  "num_raw_episodes": 500,
+  "num_used_episodes": 500,
+  "num_skipped_short_episodes": 0,
+  "task_prompts": {
+    "multi_usb": "Insert USB connector into USB port",
+    "multi_rotary_switch": "Grasp rotary switch and rotate clockwise",
+    "multi_lan": "Insert LAN cable into Ethernet port",
+    "multi_outlet": "Insert plug into outlet",
+    "multi_knob": "Grasp knob and rotate clockwise",
+    "multi_bnc": "Insert BNC connector and rotate clockwise",
+    "multi_hdmi": "Insert HDMI connector into HDMI port",
+    "multi_bar_latch": "Grasp bar latch and rotate clockwise",
+    "multi_audiojack": "Insert audio jack into audio port",
+    "multi_key_lock": "Insert key and rotate clockwise"
+  },
+  "task_episode_count": {
+    "multi_hdmi": 50,
+    "multi_bar_latch": 50,
+    "multi_usb": 50,
+    "multi_key_lock": 50,
+    "multi_knob": 50,
+    "multi_outlet": 50,
+    "multi_bnc": 50,
+    "multi_lan": 50,
+    "multi_rotary_switch": 50,
+    "multi_audiojack": 50
+  },
+  "train_split": {
+    "episode_count": 500,
+    "step_count": 177159,
+    "skipped_episode_count": 0,
+    "per_task_episode_count": {
+      "multi_hdmi": 50,
+      "multi_bar_latch": 50,
+      "multi_usb": 50,
+      "multi_key_lock": 50,
+      "multi_knob": 50,
+      "multi_outlet": 50,
+      "multi_bnc": 50,
+      "multi_lan": 50,
+      "multi_rotary_switch": 50,
+      "multi_audiojack": 50
+    }
+  },
+  "validation_split": {
+    "episode_count": 0,
+    "step_count": 0,
+    "skipped_episode_count": 0,
+    "per_task_episode_count": {}
+  }
+}
