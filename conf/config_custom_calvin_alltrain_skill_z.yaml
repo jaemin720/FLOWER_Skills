@@ -6,7 +6,7 @@ defaults:
   - override hydra/job_logging: colorlog
   - override hydra/hydra_logging: colorlog
 
-root_data_dir: /home/jack/flower_vla_calvin/multi_task_dataset_raw_action_alltrain
+root_data_dir: /home/jack/flower_vla_calvin/multi_task_dataset_real_robot_13d_norm_force_history_butter_norm
 lang_folder: lang_clip_resnet50
 
 log_dir: /data2/jack/log
@@ -14,7 +14,7 @@ slurm: false
 seed: 242
 device: 'cuda'
 batch_size: 16
-devices: 2
+devices: 4
 act_dim: 7
 proprio_dims: 13
 obs_dim: 512
@@ -29,12 +29,12 @@ skill_z_dim: 256
 act_seq_len: ${skill_action_seq_len}
 multistep: ${skill_action_seq_len}
 
-quest_autoencoder_checkpoint: /home/jack/flower_vla_calvin/quest/multitask_model_epoch_0200.pth
+quest_autoencoder_checkpoint: /home/jack/flower_vla_calvin/quest/ft_adaln/multitask_model_epoch_0200.pth
 
 p_last_state: 0
 gen_img_res: 112
 max_epochs: 20
-num_workers: 4
+num_workers: 2
 benchmark_name: custom_flower
 use_extracted_rel_actions: false
 

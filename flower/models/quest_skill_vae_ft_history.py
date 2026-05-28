@@ -253,7 +253,6 @@ class SkillVAEFTAdaLN(SkillVAE):
                  ft_downsample_mode='avg',
                  ft_conv_strides=None,
                  ft_conv_kernel_sizes=None,
-                 ft_project_condition=False,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.use_ft_conditioning = True
@@ -261,17 +260,11 @@ class SkillVAEFTAdaLN(SkillVAE):
         self.ft_downsample_mode = ft_downsample_mode
         self.ft_conv_strides = list(ft_conv_strides) if ft_conv_strides is not None else None
         self.ft_conv_kernel_sizes = list(ft_conv_kernel_sizes) if ft_conv_kernel_sizes is not None else None
-        self.ft_project_condition = ft_project_condition
 
-        if self.ft_project_condition:
-            self.ft_proj = nn.Linear(ft_dim, self.encoder_dim)
-            ft_feature_dim = self.encoder_dim
-        else:
-            ft_feature_dim = ft_dim
+        # common projection: (B, H, 6) or (B, H, S, 6) -> (..., D)
+        self.ft_proj = nn.Linear(ft_dim, self.encoder_dim)
 
         if ft_downsample_mode == 'conv':
-            if not self.ft_project_condition:
-                raise ValueError("ft_downsample_mode='conv' requires ft_project_condition=True.")
             self.ft_conv_block = ResidualTemporalBlock(
                 self.encoder_dim,
                 self.encoder_dim,
@@ -282,15 +275,12 @@ class SkillVAEFTAdaLN(SkillVAE):
             cond_dim = self.encoder_dim
 
         elif ft_downsample_mode in ['avg', 'max']:
-            cond_dim = ft_feature_dim
+            cond_dim = self.encoder_dim
 
         elif ft_downsample_mode == 'avg_max':
-            if self.ft_project_condition:
-                # avg + max gives 2D, project back to D
-                self.ft_avg_max_proj = nn.Linear(2 * self.encoder_dim, self.encoder_dim)
-                cond_dim = self.encoder_dim
-            else:
-                cond_dim = 2 * ft_dim
+            # avg + max gives 2D, project back to D
+            self.ft_avg_max_proj = nn.Linear(2 * self.encoder_dim, self.encoder_dim)
+            cond_dim = self.encoder_dim
 
         else:
             raise ValueError(f"Unsupported ft_downsample_mode: {ft_downsample_mode}")
@@ -373,11 +363,9 @@ class SkillVAEFTAdaLN(SkillVAE):
 
     def _get_ft_cond(self, ft, target_len):
         if ft is None:
-            cond_dim = self.encoder.layers[0].adaLN_modulation[-1].in_features
-            return torch.zeros((1, target_len, cond_dim), device=self.device)
+            return torch.zeros((1, target_len, self.encoder_dim), device=self.device)
 
-        if self.ft_project_condition:
-            ft = self.ft_proj(ft)
+        ft = self.ft_proj(ft)
 
         if ft.dim() == 4:
             B, T, samples_per_step, C = ft.shape

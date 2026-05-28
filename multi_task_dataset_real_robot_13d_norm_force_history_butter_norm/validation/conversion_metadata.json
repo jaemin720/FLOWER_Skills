@@ -1,0 +1,15 @@
+{
+  "split": "validation",
+  "saved_episode_count": 0,
+  "skipped_episode_count": 0,
+  "saved_step_count": 0,
+  "lang_folder": "lang_clip_resnet50",
+  "robot_obs_dim": 13,
+  "robot_obs_format": "real_robot",
+  "normalize_robot_obs": true,
+  "history_obs_keys": [
+    "right_force_history"
+  ],
+  "per_task_episode_count": {},
+  "metadata": []
+}

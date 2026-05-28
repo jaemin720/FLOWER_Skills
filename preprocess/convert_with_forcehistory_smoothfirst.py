@@ -274,13 +274,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ft_history_sample_rate_hz",
         type=float,
-        default=100.0,
+        default=10.0,
         help="Sample rate used when --ft_history_filter=butterworth.",
     )
     parser.add_argument(
         "--ft_history_cutoff_hz",
         type=float,
-        default=10.0,
+        default=2.0,
         help="Cutoff frequency used when --ft_history_filter=butterworth.",
     )
     parser.add_argument(
@@ -294,7 +294,7 @@ def parse_args() -> argparse.Namespace:
         dest="normalize_ft_history",
         action="store_true",
         default=False,
-        help="Normalize copied F/T history observations with raw dataset-level mean/std before optional smoothing.",
+        help="Normalize copied F/T history observations with dataset-level mean/std after optional smoothing.",
     )
     parser.add_argument(
         "--no_normalize_ft_history",
@@ -775,6 +775,7 @@ def process_ft_history_observations(
             if "default" in stats:
                 stats[key] = stats["default"]
                 continue
+            sequences = [smooth_history_sequence(seq, args) for seq in sequences]
             flat = np.concatenate([seq.reshape(-1, seq.shape[-1]) for seq in sequences], axis=0)
             stats[key] = {
                 "mean": flat.mean(axis=0).astype(np.float32),
@@ -784,10 +785,10 @@ def process_ft_history_observations(
     for record_index, record in enumerate(records):
         for key in history_keys:
             history = raw_by_key[key][record_index]
+            history = smooth_history_sequence(history, args)
             if args.normalize_ft_history:
                 key_stats = stats[key]
                 history = ((history - key_stats["mean"]) / key_stats["std"]).astype(np.float32)
-            history = smooth_history_sequence(history, args)
             for step, value in zip(record.steps, history):
                 step["observations"][key] = value
 
@@ -802,8 +803,8 @@ def process_ft_history_observations(
         "keys": list(history_keys),
         "filter": args.ft_history_filter,
         "normalize": args.normalize_ft_history,
-        "processing_order": "normalize_then_smooth",
-        "stats_domain": "raw_history",
+        "processing_order": "smooth_then_normalize",
+        "stats_domain": "smoothed_history",
         "sample_rate_hz": args.ft_history_sample_rate_hz,
         "cutoff_hz": args.ft_history_cutoff_hz,
         "filter_order": args.ft_history_filter_order,

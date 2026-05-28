@@ -1,7 +1,7 @@
-python /home/jack/flower_vla_calvin/preprocess/convert_with_forcehistory.py \
+python /home/jack/flower_vla_calvin/preprocess/convert_with_forcehistory_smoothfirst.py \
   --input /data2/jack/2026_05_AGI/default_lsm/lsm/multi \
   --pkl_glob "**/*.pkl" \
-  --output_root /home/jack/flower_vla_calvin/multi_task_dataset_real_robot_13d_norm_force_history_butter_norm \
+  --output_root /home/jack/flower_vla_calvin/multi_task_dataset_real_robot_13d_norm_force_history_butter_first \
   --robot_obs_format real_robot \
   --normalize_state \
   --include_right_force_history \

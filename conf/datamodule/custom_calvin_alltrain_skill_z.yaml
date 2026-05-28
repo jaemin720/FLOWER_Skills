@@ -15,12 +15,16 @@ observation_space:
   rgb_obs: ['rgb_static', 'rgb_gripper']
   depth_obs: []
   state_obs: ['robot_obs']
+  ft_obs: ['right_force_history']
   actions: ['rel_actions']
   language: ['language']
 
 proprioception_dims:
-  n_state_obs: 13
-  keep_indices: [[0, 13]]
+  n_state_obs: ${proprio_dims}
+  keep_indices:
+    -
+      - 0
+      - ${proprio_dims}
   normalize: false
   normalize_robot_orientation: false
 

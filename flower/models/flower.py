@@ -3,14 +3,12 @@ import os
 import sys
 from typing import Any, Dict, Optional, Tuple, Collection, List
 from functools import partial
-import math
 import functools
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 import hydra
 from omegaconf import DictConfig, OmegaConf
 import pytorch_lightning as pl
@@ -130,35 +128,29 @@ class FLOWERVLA(pl.LightningModule):
 
         load_pretrained: bool = False,
         pretrained_model_path: str = None,
-
-        # QueST skill conditioning
-        use_quest_skill: bool = False,
+        flow_target: str = "actions",
+        quest_autoencoder_checkpoint: Optional[str] = None,
+        skill_embedding_space: str = "encoder",
+        decode_skill_actions_for_inference: bool = False,
+        clip_sampled_actions: Optional[bool] = None,
         quest_repo_path: Optional[str] = "/home/jack/quest_practice/QueST",
-        quest_autoencoder_ckpt: Optional[str] = None,
-        quest_skill_label_path: Optional[str] = None,
-        quest_skill_loss_weight: float = 1.0,
-        quest_skill_conditioning: bool = True,
-        quest_skill_condition_source: str = "teacher",
-        quest_skill_block_size: int = 32,
-        quest_downsample_factor: int = 4,
-        quest_vq_type: str = "fsq",
-        quest_fsq_level: Optional[List[int]] = None,
-        quest_codebook_size: int = 1024,
-        quest_codebook_dim: int = 512,
-        quest_encoder_dim: int = 256,
-        quest_decoder_dim: int = 256,
-        quest_attn_pdrop: float = 0.1,
-        quest_use_causal_encoder: bool = True,
-        quest_use_causal_decoder: bool = True,
-        quest_encoder_heads: int = 4,
-        quest_encoder_layers: int = 2,
-        quest_decoder_heads: int = 4,
-        quest_decoder_layers: int = 4,
     ):
         super().__init__()
         self.save_hyperparameters()
         # self.automatic_optimization = False
         self.action_space_index = ActionIndex()
+        self.flow_target = flow_target
+        self.skill_embedding_space = skill_embedding_space
+        self.decode_skill_actions_for_inference = decode_skill_actions_for_inference
+        self.quest_autoencoder_checkpoint = quest_autoencoder_checkpoint
+        self.clip_sampled_actions = flow_target == "actions" if clip_sampled_actions is None else clip_sampled_actions
+        self.skill_target_autoencoder = None
+        if self.flow_target not in ("actions", "skill_z"):
+            raise ValueError(f"Unsupported flow_target: {self.flow_target}")
+        if self.skill_embedding_space not in ("encoder", "quantizer"):
+            raise ValueError(f"Unsupported skill_embedding_space: {self.skill_embedding_space}")
+        if self.flow_target == "skill_z":
+            self.action_space_index.action_dims["eef_delta"] = action_dim
         # Initialize model flags and configurations
         self._init_flags(
             use_second_view=use_second_view,
@@ -190,6 +182,11 @@ class FLOWERVLA(pl.LightningModule):
             num_sampling_steps=num_sampling_steps,
         )
         self.target_modality = "actions"
+        if self.flow_target == "skill_z":
+            self.skill_target_autoencoder = self._load_skill_target_autoencoder(
+                quest_autoencoder_checkpoint,
+                quest_repo_path,
+            )
         # Setup VLM and core components
         self._setup_vlm(vlm_path, freeze_vision_tower, freeze_florence)
         hidden_dim = self.vlm.config.text_config.d_model
@@ -214,34 +211,7 @@ class FLOWERVLA(pl.LightningModule):
             query_seq_len=query_seq_len,
             rope_theta=rope_theta,
         )
-        self._setup_quest_skill_components(
-            use_quest_skill=use_quest_skill,
-            quest_repo_path=quest_repo_path,
-            quest_autoencoder_ckpt=quest_autoencoder_ckpt,
-            quest_skill_label_path=quest_skill_label_path,
-            quest_skill_loss_weight=quest_skill_loss_weight,
-            quest_skill_conditioning=quest_skill_conditioning,
-            quest_skill_condition_source=quest_skill_condition_source,
-            quest_skill_block_size=quest_skill_block_size,
-            quest_downsample_factor=quest_downsample_factor,
-            quest_vq_type=quest_vq_type,
-            quest_fsq_level=quest_fsq_level,
-            quest_codebook_size=quest_codebook_size,
-            quest_codebook_dim=quest_codebook_dim,
-            quest_encoder_dim=quest_encoder_dim,
-            quest_decoder_dim=quest_decoder_dim,
-            quest_attn_pdrop=quest_attn_pdrop,
-            quest_use_causal_encoder=quest_use_causal_encoder,
-            quest_use_causal_decoder=quest_use_causal_decoder,
-            quest_encoder_heads=quest_encoder_heads,
-            quest_encoder_layers=quest_encoder_layers,
-            quest_decoder_heads=quest_decoder_heads,
-            quest_decoder_layers=quest_decoder_layers,
-            hidden_dim=hidden_dim,
-            action_dim=action_dim,
-            act_window_size=act_window_size,
-        )
-        
+
         # Initialize state tracking
         self.rollout_step_counter = 0
         self.pred_action_seq = None
@@ -254,159 +224,94 @@ class FLOWERVLA(pl.LightningModule):
         if load_pretrained and pretrained_model_path is not None:
             self._load_pretrained_weights(pretrained_model_path)
 
-    def _setup_quest_skill_components(self, **kwargs):
-        self.use_quest_skill = kwargs["use_quest_skill"]
-        self.quest_skill_loss_weight = kwargs["quest_skill_loss_weight"]
-        self.quest_skill_conditioning = kwargs["quest_skill_conditioning"]
-        self.quest_skill_condition_source = kwargs["quest_skill_condition_source"]
-        self.quest_skill_autoencoder = None
-        self.quest_skill_labels = None
-        self.quest_skill_teacher_available = False
-
-        if not self.use_quest_skill:
-            return
-
-        if self.quest_skill_condition_source not in ("teacher", "predicted"):
-            raise ValueError(
-                "quest_skill_condition_source must be either 'teacher' or 'predicted', "
-                f"got {self.quest_skill_condition_source}"
-            )
-        if kwargs["act_window_size"] != kwargs["quest_skill_block_size"]:
-            raise ValueError(
-                "FLOWER act_window_size must match QueST skill_block_size when use_quest_skill=True: "
-                f"{kwargs['act_window_size']} vs {kwargs['quest_skill_block_size']}"
-            )
-        if kwargs["quest_skill_block_size"] % kwargs["quest_downsample_factor"] != 0:
-            raise ValueError("quest_skill_block_size must be divisible by quest_downsample_factor")
-        self.quest_skill_num_tokens = kwargs["quest_skill_block_size"] // kwargs["quest_downsample_factor"]
-        if kwargs["quest_vq_type"] == "fsq":
-            fsq_level = kwargs["quest_fsq_level"] or self._get_default_fsq_level(kwargs["quest_codebook_size"])
-            self.quest_skill_vocab_size = int(math.prod(fsq_level))
-        else:
-            self.quest_skill_vocab_size = int(kwargs["quest_codebook_size"])
-
-        if kwargs["quest_skill_label_path"] is not None:
-            label_path = Path(kwargs["quest_skill_label_path"]).expanduser()
-            if not label_path.is_file():
-                raise FileNotFoundError(f"QueST skill label file does not exist: {label_path}")
-            self.quest_skill_labels = np.load(label_path, mmap_mode="r")
-            if self.quest_skill_labels.ndim != 2 or self.quest_skill_labels.shape[1] != self.quest_skill_num_tokens:
-                raise ValueError(
-                    "Expected quest_skill_label_path to have shape [num_windows, num_skill_tokens], "
-                    f"got {self.quest_skill_labels.shape}"
-                )
-            self.quest_skill_teacher_available = True
-            print(f"Loaded precomputed QueST skill labels from {label_path}: {self.quest_skill_labels.shape}")
-        elif kwargs["quest_autoencoder_ckpt"] is not None:
-            self._setup_quest_autoencoder_teacher(kwargs)
-            self.quest_skill_teacher_available = True
-        else:
-            print(
-                "QueST skill teacher is not configured. This is valid for inference; "
-                "training with skill supervision requires quest_skill_label_path or quest_autoencoder_ckpt."
-            )
-
-        hidden_dim = kwargs["hidden_dim"]
-        self.quest_skill_head = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, self.quest_skill_num_tokens * self.quest_skill_vocab_size),
-        )
-        self.quest_skill_token_embedding = nn.Embedding(self.quest_skill_vocab_size, hidden_dim)
-        self.quest_skill_pos_embedding = nn.Parameter(torch.zeros(1, self.quest_skill_num_tokens, hidden_dim))
-
-    def _get_default_fsq_level(self, codebook_size: int) -> List[int]:
-        power = int(math.log2(codebook_size))
-        fsq_levels = {
-            4: [5, 3],
-            6: [8, 8],
-            8: [8, 6, 5],
-            9: [8, 8, 8],
-            10: [8, 5, 5, 5],
-            11: [8, 8, 6, 5],
-            12: [7, 5, 5, 5, 5],
-        }
-        if power not in fsq_levels:
-            raise ValueError(f"No default FSQ level for codebook_size={codebook_size}")
-        return fsq_levels[power]
-
-    def _setup_quest_autoencoder_teacher(self, kwargs):
-        quest_repo_path = kwargs["quest_repo_path"]
+    def _load_skill_target_autoencoder(
+        self,
+        checkpoint_path: Optional[str],
+        quest_repo_path: Optional[str],
+    ) -> nn.Module:
+        if checkpoint_path is None:
+            raise ValueError("flow_target='skill_z' requires quest_autoencoder_checkpoint.")
         if quest_repo_path is not None:
             quest_repo_path = str(Path(quest_repo_path).expanduser())
-            if quest_repo_path not in sys.path:
+            if os.path.exists(quest_repo_path) and quest_repo_path not in sys.path:
                 sys.path.insert(0, quest_repo_path)
 
         try:
-            from quest.algos.quest_modules.skill_vae import SkillVAE
-        except ModuleNotFoundError as exc:
-            raise ModuleNotFoundError(
-                "use_quest_skill=True with quest_autoencoder_ckpt requires QueST dependencies "
-                "inside the FLOWER environment. Install vector-quantize-pytorch and "
-                "positional-encodings, or provide quest_skill_label_path instead."
+            from hydra.utils import instantiate
+        except ImportError as exc:
+            raise ImportError(
+                "Could not import hydra.utils.instantiate. Install hydra-core in the training environment."
             ) from exc
 
-        self.quest_skill_autoencoder = SkillVAE(
-            action_dim=kwargs["action_dim"],
-            encoder_dim=kwargs["quest_encoder_dim"],
-            decoder_dim=kwargs["quest_decoder_dim"],
-            skill_block_size=kwargs["quest_skill_block_size"],
-            downsample_factor=kwargs["quest_downsample_factor"],
-            attn_pdrop=kwargs["quest_attn_pdrop"],
-            use_causal_encoder=kwargs["quest_use_causal_encoder"],
-            use_causal_decoder=kwargs["quest_use_causal_decoder"],
-            encoder_heads=kwargs["quest_encoder_heads"],
-            encoder_layers=kwargs["quest_encoder_layers"],
-            decoder_heads=kwargs["quest_decoder_heads"],
-            decoder_layers=kwargs["quest_decoder_layers"],
-            vq_type=kwargs["quest_vq_type"],
-            fsq_level=kwargs["quest_fsq_level"],
-            codebook_dim=kwargs["quest_codebook_dim"],
-            codebook_size=kwargs["quest_codebook_size"],
+        checkpoint_path = str(Path(checkpoint_path).expanduser())
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        cfg = checkpoint.get("cfg", checkpoint.get("config"))
+        if cfg is None:
+            raise KeyError(f"QueST checkpoint has no cfg/config entry: {checkpoint_path}")
+        cfg = OmegaConf.create(cfg)
+
+        state = checkpoint.get("model", checkpoint.get("state_dict", checkpoint))
+        autoencoder_cfg = OmegaConf.to_container(cfg.algo.policy.autoencoder, resolve=False)
+        autoencoder_cfg["action_dim"] = int(cfg.task.shape_meta.action_dim)
+        autoencoder_cfg["skill_block_size"] = int(cfg.algo.skill_block_size)
+        autoencoder_cfg["downsample_factor"] = int(cfg.algo.downsample_factor)
+        autoencoder_cfg["codebook_size"] = int(cfg.algo.codebook_size)
+
+        autoencoder_state = {
+            key.removeprefix("autoencoder."): value
+            for key, value in state.items()
+            if key.startswith("autoencoder.")
+        }
+        has_prefixed_autoencoder_state = bool(autoencoder_state)
+        if not has_prefixed_autoencoder_state:
+            autoencoder_state = state
+
+        original_target = str(autoencoder_cfg.get("_target_", ""))
+        has_ft_history_cfg = any(
+            key in autoencoder_cfg
+            for key in ("ft_dim", "ft_downsample_mode", "ft_conv_strides", "ft_conv_kernel_sizes")
         )
-        self._load_quest_autoencoder_weights(kwargs["quest_autoencoder_ckpt"])
-        self.quest_skill_autoencoder.eval()
-        for param in self.quest_skill_autoencoder.parameters():
+        has_ft_history_state = any(
+            key.startswith(("ft_proj.", "ft_conv_block.", "ft_avg_max_proj."))
+            or "adaLN_modulation" in key
+            for key in autoencoder_state.keys()
+        )
+        if (
+            original_target.endswith("SkillVAEFTAdaLN")
+            or has_ft_history_cfg
+            or has_ft_history_state
+        ):
+            autoencoder_cfg["_target_"] = "flower.models.quest_skill_vae.SkillVAEFTAdaLN"
+            if "ft_project_condition" not in autoencoder_cfg:
+                autoencoder_cfg["ft_project_condition"] = any(
+                    key.startswith("ft_proj.") for key in autoencoder_state.keys()
+                )
+        else:
+            autoencoder_cfg["_target_"] = "flower.models.quest_skill_vae.SkillVAE"
+
+        autoencoder = instantiate(OmegaConf.create(autoencoder_cfg))
+
+        missing_keys, unexpected_keys = autoencoder.load_state_dict(
+            autoencoder_state,
+            strict=has_prefixed_autoencoder_state,
+        )
+        if missing_keys:
+            logger.warning("QueST autoencoder missing keys while loading: %s", missing_keys[:20])
+        if unexpected_keys:
+            logger.warning("QueST autoencoder unexpected keys while loading: %s", unexpected_keys[:20])
+
+        autoencoder.eval()
+        for param in autoencoder.parameters():
             param.requires_grad = False
 
-    def _resolve_quest_checkpoint(self, checkpoint_path: str) -> Path:
-        path = Path(checkpoint_path).expanduser()
-        if path.is_file():
-            return path
-        if not path.is_dir():
-            raise FileNotFoundError(f"QueST checkpoint path does not exist: {path}")
-
-        candidates = []
-        for suffix in ("*.pth", "*.pt", "*.ckpt"):
-            candidates.extend(path.glob(suffix))
-        if not candidates:
-            raise FileNotFoundError(f"No checkpoint files found in QueST checkpoint directory: {path}")
-        return sorted(candidates, key=lambda item: item.stat().st_mtime)[-1]
-
-    def _load_quest_autoencoder_weights(self, checkpoint_path: str):
-        checkpoint_path = self._resolve_quest_checkpoint(checkpoint_path)
-        print(f"Loading QueST SkillVAE teacher from {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
-        state_dict = checkpoint.get("model", checkpoint.get("state_dict", checkpoint))
-        model_state = self.quest_skill_autoencoder.state_dict()
-        autoencoder_state = {}
-
-        prefixes = ("autoencoder.", "policy.autoencoder.", "agent.autoencoder.")
-        for key, value in state_dict.items():
-            stripped_key = key
-            for prefix in prefixes:
-                if stripped_key.startswith(prefix):
-                    stripped_key = stripped_key[len(prefix):]
-                    break
-            if stripped_key in model_state and model_state[stripped_key].shape == value.shape:
-                autoencoder_state[stripped_key] = value
-
-        missing_keys, unexpected_keys = self.quest_skill_autoencoder.load_state_dict(autoencoder_state, strict=False)
-        print(
-            "Loaded QueST SkillVAE teacher: "
-            f"{len(autoencoder_state)} tensors, missing={len(missing_keys)}, unexpected={len(unexpected_keys)}"
+        logger.info(
+            "Loaded QueST autoencoder from %s as %s with skill_block_size=%s, encoder_dim=%s",
+            checkpoint_path,
+            autoencoder_cfg["_target_"],
+            getattr(autoencoder, "skill_block_size", "unknown"),
+            getattr(autoencoder, "encoder_dim", "unknown"),
         )
+        return autoencoder
 
     def _load_pretrained_weights(self, pretrained_model_path: str, mean_resizing: bool = False):
         """Loads pretrained weights, handling key mismatches (e.g., different prefixes)."""
@@ -712,6 +617,45 @@ class FLOWERVLA(pl.LightningModule):
             {"params": no_decay_group, "weight_decay": 0.0}
         ]
 
+    @torch.no_grad()
+    def _encode_skill_targets(self, batch: Dict) -> torch.Tensor:
+        if self.skill_target_autoencoder is None:
+            raise RuntimeError("skill_target_autoencoder is not loaded.")
+
+        actions = batch["actions"]
+        if len(actions.shape) == 4:
+            actions = actions.squeeze(1)
+        actions = actions.to(self.device, dtype=torch.float32)
+
+        autoencoder = self.skill_target_autoencoder.to(self.device)
+        autoencoder.eval()
+
+        ft = batch.get("masked_ft", batch.get("ft", None))
+        if getattr(autoencoder, "use_ft_conditioning", False):
+            ft = ft.to(self.device, dtype=torch.float32) if ft is not None else None
+            z_raw = autoencoder.encode(actions, ft=ft)
+        else:
+            z_raw = autoencoder.encode(actions)
+
+        if self.skill_embedding_space == "quantizer":
+            project_in = getattr(getattr(autoencoder, "vq", None), "project_in", None)
+            if project_in is None:
+                raise ValueError("skill_embedding_space='quantizer' requires autoencoder.vq.project_in.")
+            z_raw = project_in(z_raw)
+
+        if z_raw.shape[1] != self.act_window_size or z_raw.shape[2] != self.action_dim:
+            raise ValueError(
+                "QueST z target shape does not match FLOWER output shape: "
+                f"z={tuple(z_raw.shape)}, expected (*, {self.act_window_size}, {self.action_dim}). "
+                "Check skill_action_seq_len, skill_z_seq_len, skill_z_dim, and the QueST autoencoder config."
+            )
+        return z_raw.detach()
+
+    def _get_flow_targets(self, batch: Dict) -> torch.Tensor:
+        if self.flow_target == "skill_z":
+            return self._encode_skill_targets(batch)
+        return batch["actions"]
+
     def training_step(self, batch: Dict[str, Dict], batch_idx: int) -> torch.Tensor:
         """Lightning training step"""
         # Get optimizer
@@ -719,31 +663,23 @@ class FLOWERVLA(pl.LightningModule):
         
         # Compute loss
         total_loss = torch.tensor(0.0, device=self.device)
-        action_loss = torch.tensor(0.0, device=self.device) 
-        skill_loss = torch.tensor(0.0, device=self.device)
+        flow_loss = torch.tensor(0.0, device=self.device)
         total_bs = 0
 
         for modality_scope, dataset_batch in batch.items():
             self.modality_scope = modality_scope
             obs_features = self.encode_observations(dataset_batch)
-            batch_skill_loss = self.add_quest_skill_conditioning(
-                obs_features,
-                actions=dataset_batch["actions"],
-                batch_indices=dataset_batch.get("idx"),
-                train_mode=True,
-            )
-            act_loss, losses_dict = self.rf_loss(obs_features, dataset_batch["actions"])
-            action_loss = action_loss + act_loss
-            skill_loss = skill_loss + batch_skill_loss
-            total_loss = total_loss + act_loss + self.quest_skill_loss_weight * batch_skill_loss
-            total_bs = total_bs + len(dataset_batch["actions"])
+            flow_targets = self._get_flow_targets(dataset_batch)
+            batch_flow_loss, losses_dict = self.rf_loss(obs_features, flow_targets)
+            flow_loss = flow_loss + batch_flow_loss
+            total_loss = total_loss + batch_flow_loss
+            total_bs = total_bs + len(flow_targets)
 
         total_loss = total_loss / len(batch)
-        action_loss = action_loss / len(batch)
-        skill_loss = skill_loss / len(batch)
+        flow_loss = flow_loss / len(batch)
 
         # Log metrics
-        self._log_training_metrics(total_loss, action_loss, total_bs, skill_loss=skill_loss)
+        self._log_training_metrics(total_loss, flow_loss, total_bs)
 
         # Optimization step
         # opt.zero_grad()
@@ -760,20 +696,14 @@ class FLOWERVLA(pl.LightningModule):
          #if sch is not None:
         #     sch.step()
 
-        return total_loss
+        return flow_loss
 
     def validation_step(self, batch: Dict[str, Dict], batch_idx: int) -> Dict[str, torch.Tensor]:
         """Lightning validation step"""
         output = {}
         with torch.no_grad():
             obs_features = self.encode_observations(batch)
-            target_actions = batch[self.target_modality]
-            self.add_quest_skill_conditioning(
-                obs_features,
-                actions=target_actions,
-                batch_indices=batch.get("idx"),
-                train_mode=False,
-            )
+            target_actions = self._get_flow_targets(batch)
             
             # Generate noise for sampling
             noise_actions = torch.randn_like(target_actions, device=self.device)
@@ -841,99 +771,6 @@ class FLOWERVLA(pl.LightningModule):
 
         return loss, losses_dict
 
-    def add_quest_skill_conditioning(
-        self,
-        cond_dict: Dict[str, torch.Tensor],
-        actions: Optional[torch.Tensor] = None,
-        batch_indices: Optional[torch.Tensor] = None,
-        train_mode: bool = False,
-    ) -> torch.Tensor:
-        if not self.use_quest_skill:
-            return torch.tensor(0.0, device=self.device)
-
-        features = cond_dict["features"]
-        skill_logits = self.predict_quest_skill_logits(features)
-        predicted_indices = skill_logits.argmax(dim=-1)
-        skill_loss = torch.tensor(0.0, device=features.device)
-        teacher_indices = None
-
-        if self.quest_skill_teacher_available and (
-            actions is not None or (self.quest_skill_labels is not None and batch_indices is not None)
-        ):
-            teacher_indices = self.get_quest_teacher_skill_indices(actions, batch_indices=batch_indices)
-            if teacher_indices.shape[1] != self.quest_skill_num_tokens:
-                raise ValueError(
-                    "QueST teacher returned an unexpected number of skill tokens: "
-                    f"{teacher_indices.shape[1]} vs {self.quest_skill_num_tokens}"
-                )
-            if train_mode:
-                skill_loss = F.cross_entropy(
-                    skill_logits.reshape(-1, self.quest_skill_vocab_size),
-                    teacher_indices.reshape(-1),
-                )
-        elif train_mode and actions is not None:
-            raise ValueError(
-                "Training with use_quest_skill=True requires a QueST teacher. "
-                "Set quest_skill_label_path to precomputed labels or quest_autoencoder_ckpt to a trained "
-                "QueST stage-0 checkpoint. Inference can leave both unset."
-            )
-
-        if self.quest_skill_condition_source == "teacher" and teacher_indices is not None and train_mode:
-            conditioning_indices = teacher_indices
-        else:
-            conditioning_indices = predicted_indices
-
-        if self.quest_skill_conditioning:
-            skill_embeds = self.embed_quest_skill_indices(conditioning_indices, dtype=features.dtype)
-            cond_dict["features"] = torch.cat([features, skill_embeds], dim=1)
-
-        cond_dict["quest_skill_logits"] = skill_logits
-        cond_dict["quest_skill_indices"] = conditioning_indices
-        if teacher_indices is not None:
-            cond_dict["quest_teacher_skill_indices"] = teacher_indices
-        return skill_loss
-
-    def predict_quest_skill_logits(self, features: torch.Tensor) -> torch.Tensor:
-        pooled = features.mean(dim=1)
-        logits = self.quest_skill_head(pooled)
-        return logits.view(features.shape[0], self.quest_skill_num_tokens, self.quest_skill_vocab_size)
-
-    def embed_quest_skill_indices(self, indices: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-        indices = indices.clamp(min=0, max=self.quest_skill_vocab_size - 1).long()
-        embeds = self.quest_skill_token_embedding(indices)
-        embeds = embeds + self.quest_skill_pos_embedding.to(device=embeds.device, dtype=embeds.dtype)
-        return embeds.to(dtype=dtype)
-
-    @torch.no_grad()
-    def get_quest_teacher_skill_indices(
-        self,
-        actions: Optional[torch.Tensor],
-        batch_indices: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if self.quest_skill_labels is not None:
-            if batch_indices is None:
-                raise ValueError("quest_skill_label_path requires batch['idx'] to gather teacher skill labels")
-            index_np = batch_indices.detach().cpu().numpy().astype(np.int64)
-            labels = np.asarray(self.quest_skill_labels[index_np], dtype=np.int64)
-            device = actions.device if actions is not None else self.device
-            return torch.as_tensor(labels, device=device, dtype=torch.long)
-
-        if actions is None:
-            raise ValueError("actions are required when using an on-the-fly QueST SkillVAE teacher")
-        if self.quest_skill_autoencoder is None:
-            raise ValueError("No QueST SkillVAE teacher is configured")
-        if len(actions.shape) == 4:
-            actions = actions.squeeze(1)
-        if actions.shape[1] != self.quest_skill_autoencoder.skill_block_size:
-            raise ValueError(
-                "FLOWER action sequence length must match QueST skill_block_size: "
-                f"{actions.shape[1]} vs {self.quest_skill_autoencoder.skill_block_size}"
-            )
-
-        ae_param = next(self.quest_skill_autoencoder.parameters())
-        teacher_actions = actions.to(device=ae_param.device, dtype=ae_param.dtype)
-        return self.quest_skill_autoencoder.get_indices(teacher_actions).long().to(actions.device)
-
     def sample_actions(self, z: torch.Tensor, cond: Dict[str, torch.Tensor], inference: bool=False):
         """
         Sample actions using Euler method.
@@ -954,7 +791,7 @@ class FLOWERVLA(pl.LightningModule):
             vc = self.dit_forward(z, t_tensor, cond)
             z = z - dt_tensor * vc
 
-        return z.clamp(-1, 1)
+        return z.clamp(-1, 1) if self.clip_sampled_actions else z
 
     def dit_forward(self, z: torch.Tensor, t: torch.Tensor, cond_dict: dict) -> torch.Tensor:
         """
@@ -1118,7 +955,7 @@ class FLOWERVLA(pl.LightningModule):
         batch_size = len(batch["rgb_obs"]['rgb_static'])
         embed_tensor = torch.zeros(batch_size, 1, 1)
         # Single-action-space setup: action type is one id per batch element.
-        action_type_tensor = torch.ones(batch_size, dtype=torch.long)
+        action_type_tensor = torch.ones(batch_size, dtype=torch.long, device=device)
         # Process primary image
         image_tensor = batch["rgb_obs"]['rgb_static']
         B, T, C, H, W = image_tensor.shape
@@ -1231,6 +1068,19 @@ class FLOWERVLA(pl.LightningModule):
                 decoded = pred
         return decoded
 
+    @torch.no_grad()
+    def decode_skill_z(self, z: torch.Tensor) -> torch.Tensor:
+        if self.skill_target_autoencoder is None:
+            raise RuntimeError("skill_target_autoencoder is not loaded.")
+        if self.skill_embedding_space != "encoder":
+            raise ValueError("decode_skill_z currently expects encoder-space z_raw targets.")
+
+        autoencoder = self.skill_target_autoencoder.to(z.device)
+        autoencoder.eval()
+        z = z.to(dtype=torch.float32)
+        codes, _, _, _, _ = autoencoder.quantize(z)
+        return autoencoder.decode(codes)
+
     def forward(self, obs: Dict, goal: Dict) -> torch.Tensor:
         """
         Forward pass for inference.
@@ -1271,7 +1121,6 @@ class FLOWERVLA(pl.LightningModule):
         elif "right_force_history" in obs:
             batch["masked_ft"] = obs["right_force_history"]
         features = self.encode_observations(batch)
-        self.add_quest_skill_conditioning(features, actions=None, train_mode=False)
         
         # Generate initial noise
         noise = torch.randn(
@@ -1281,8 +1130,10 @@ class FLOWERVLA(pl.LightningModule):
             device=features['features'].device
         )
         
-        # Sample actions
-        return self.sample_actions(noise, features, inference=True)
+        sampled = self.sample_actions(noise, features, inference=True)
+        if self.flow_target == "skill_z" and self.decode_skill_actions_for_inference:
+            return self.decode_skill_z(sampled)
+        return sampled
 
     def step(self, obs: Dict, goal: Dict) -> torch.Tensor:
         """
@@ -1404,20 +1255,23 @@ class FLOWERVLA(pl.LightningModule):
         ).to(device)
         return self.vlm.get_input_embeddings()(text_inputs["input_ids"])
     
-    def _log_training_metrics(self, total_loss, action_loss, total_bs, skill_loss=None):
+    def _log_training_metrics(self, total_loss, flow_loss, total_bs):
         """
         Log training metrics
         Args:
             total_loss: Total loss value
-            action_loss: Action-specific loss value
+            flow_loss: Rectified-flow target loss value
             total_bs: Total batch size
         """
-        self.log("train/action_loss", action_loss, on_step=False, on_epoch=True, 
+        self.log("train/flow_loss", flow_loss, on_step=False, on_epoch=True,
                 sync_dist=True, batch_size=total_bs)
         self.log("train/total_loss", total_loss, on_step=False, on_epoch=True, 
                 sync_dist=True, batch_size=total_bs)
-        if self.use_quest_skill and skill_loss is not None:
-            self.log("train/quest_skill_loss", skill_loss, on_step=False, on_epoch=True,
+        if self.flow_target == "skill_z":
+            self.log("train/skill_z_loss", flow_loss, on_step=False, on_epoch=True,
+                    sync_dist=True, batch_size=total_bs)
+        else:
+            self.log("train/action_loss", flow_loss, on_step=False, on_epoch=True,
                     sync_dist=True, batch_size=total_bs)
         
     def _log_validation_metrics(self, pred_loss, val_total_act_loss_pp):
